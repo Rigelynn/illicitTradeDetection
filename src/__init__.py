@@ -9,7 +9,7 @@ from .data_processing import (
 )
 
 # 从 graph_construction 模块导入关键函数
-from .graph_construction import (
+from .build_heterogeneous_graph import (
     build_heterogeneous_graph,
     save_heterogeneous_graph,
     load_heterogeneous_graph
