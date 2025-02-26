@@ -102,7 +102,7 @@ def main():
     logging.info("订单数据处理脚本启动。")
 
     # 定义数据目录
-    processed_dir = '../data/processed/'
+    processed_dir = '../../data/processed/'
 
     # 数据库连接参数（请根据实际情况填写）
     db_params = {

@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # build_graphs_from_snapshots_pyg.py
 
 import os
@@ -106,18 +107,21 @@ def process_snapshot_file(snapshot_file_path, merchant_id_map, goods_id_map, reg
         logging.error(f"构建异构图时出错：{e}")
         return
 
+    # 如果构建的图为空，跳过保存
+    if hetero_graph is None:
+        logging.warning(f"时间截面 {snapshot_file_path} 的异构图为空，未保存。")
+        return
+
     # 提取 snapshot_str 以构造输出文件名
     snapshot_str = os.path.basename(snapshot_file_path).replace('orders_', '').replace('.csv', '')
 
-    if hetero_graph:
-        output_path = os.path.join(output_dir, f'hetero_graph_{snapshot_str}.pt')
-        try:
-            torch.save(hetero_graph, output_path)
-            logging.info(f"保存时间截面 {snapshot_str} 的异构图到 {output_path}")
-        except Exception as e:
-            logging.error(f"保存异构图失败：{e}")
-    else:
-        logging.warning(f"时间截面 {snapshot_str} 的异构图为空，未保存。")
+    output_path = os.path.join(output_dir, f'hetero_graph_{snapshot_str}.pt')
+    try:
+        torch.save(hetero_graph, output_path)
+        logging.info(f"保存时间截面 {snapshot_str} 的异构图到 {output_path}")
+    except Exception as e:
+        logging.error(f"保存异构图失败：{e}")
+
 
 def build_graphs_from_snapshots(snapshot_dir, merchant_id_map, goods_id_map, region_id_map, output_dir='data/pyg_graphs', include_timestamp=False):
     """
@@ -140,11 +144,12 @@ def build_graphs_from_snapshots(snapshot_dir, merchant_id_map, goods_id_map, reg
         logging.info(f"开始处理图文件：{snapshot_path}")
         process_snapshot_file(snapshot_path, merchant_id_map, goods_id_map, region_id_map, output_dir, include_timestamp)
 
+
 def main():
     setup_logging()
 
     # 定义路径
-    processed_dir = '../data/processed/'
+    processed_dir = '../../data/processed/'
     snapshot_dir = os.path.join(processed_dir, 'time_snapshots')
     output_dir = os.path.join(processed_dir, 'pyg_graphs')  # 保存为 PyG 格式的图
 

@@ -50,7 +50,7 @@ def main():
     logger.info("开始创建时间截面。")
 
     # 定义数据目录
-    processed_dir = '../data/processed/'
+    processed_dir = '../../data/processed/'
 
     # 加载预处理后的订单数据
     try:

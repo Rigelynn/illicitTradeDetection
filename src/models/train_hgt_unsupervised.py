@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# train_supervised_hgt.py
+# train_hgt_unsupervised.py
 
 import os
 import torch
@@ -10,19 +10,18 @@ import pickle
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import HGTConv
 from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
 
+# 指定使用的 GPU（根据需要修改）
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 #############################################
 # 辅助函数：对商户边进行重映射
 #############################################
-
 def _remap_merchant_edges(edge_index, merchant_ids, merchant_global_map, device):
     """
     将 edge_index 中第一行（商户端）的全局商户索引，
-    根据 merchant_global_map 和当前图中的 merchant_ids，
-    重新映射为局部编号。
+    根据外部提供的全局映射 merchant_global_map 和当前图中保存的 merchant_ids，
+    重新映射为局部编号（即在 [0, num_active_merchants) 内）。
     """
     mapping = {}
     for i, m in enumerate(merchant_ids):
@@ -40,26 +39,24 @@ def _remap_merchant_edges(edge_index, merchant_ids, merchant_global_map, device)
     return new_edge_index
 
 #############################################
-# 有监督 HGT 模型定义（不生成 prompt tokens）
+# 模块1：Unsupervised HGT（仅生成商户嵌入，无后续 reprogram）
 #############################################
-
-class SupervisedHGT(nn.Module):
+class UnsupervisedHGT(nn.Module):
     def __init__(self, in_channels_dict, hidden_channels, embed_size, metadata,
                  num_heads=4, num_layers=2):
         """
         参数：
-          in_channels_dict: 各节点类型的输入特征维度，如 {'merchant': num_features, 'goods': num_features}
+          in_channels_dict: 各节点类型的输入特征维度，如 {'merchant': D1, ...}
           hidden_channels: HGTConv 隐藏特征维度
-          embed_size: 投影后（同时作为分类输入）的维度
+          embed_size: 最终 merchant 嵌入的维度
           metadata: 图的元信息，格式为 (node_types, edge_types)
           num_heads: 注意力头数
           num_layers: HGTConv 层数
         """
-        super(SupervisedHGT, self).__init__()
+        super(UnsupervisedHGT, self).__init__()
         self.num_layers = num_layers
         self.metadata = metadata
 
-        # 构建多层 HGTConv + Dropout
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             if i == 0:
@@ -76,25 +73,21 @@ class SupervisedHGT(nn.Module):
             )
             self.layers.append(nn.Dropout(p=0.1))
 
-        # 投影至 embed_size
         self.embed_layer = nn.Linear(hidden_channels, embed_size)
 
-        # 分类器，用于对 merchant 进行标签预测（二分类：0/1）
-        self.classifier = nn.Linear(embed_size, 1)
-
-        # 如果 'merchant' 特征维度不等于 hidden_channels，则构造投影层
+        # 如 "merchant" 节点原始特征维度不等于 hidden_channels，则构造投影层
         self.proj_first = nn.ModuleDict()
         if "merchant" in in_channels_dict and in_channels_dict["merchant"] != hidden_channels:
             self.proj_first["merchant"] = nn.Linear(in_channels_dict["merchant"], hidden_channels)
 
-        # 外部传入：当前图中活跃商户的标识列表和全局映射
-        self.merchant_ids = None       # 例如：['A123', 'B456', ...]
+        # 外部提供当前图中活跃商户标识与全局映射
+        self.merchant_ids = None   # 例如：['A123', 'B456', ...]
         self.merchant_global_map = None  # 例如：{'A123': 1023, 'B456': 2048, ...}
 
     def forward(self, x_dict, edge_index_dict):
         device = next(self.parameters()).device
 
-        # 对 "merchant" 节点对应的边进行重新映射
+        # 若设置了 merchant_ids 与全局映射，则重映射商户边
         if self.merchant_ids is not None and self.merchant_global_map is not None:
             for key in edge_index_dict.keys():
                 if key[0] == "merchant":
@@ -121,47 +114,24 @@ class SupervisedHGT(nn.Module):
         merchant_features = x_dict.get("merchant", x_dict_backup.get("merchant"))
         if merchant_features.shape[1] != self.embed_layer.in_features:
             raise KeyError(
-                f"'merchant' 节点特征维度为 {merchant_features.shape[1]}，期望为 {self.embed_layer.in_features}"
-            )
+                f"'merchant' 节点特征维度为 {merchant_features.shape[1]}，期望为 {self.embed_layer.in_features}")
         embeddings = self.embed_layer(merchant_features)
-        # 分类分支：对 merchant embedding 进行二分类预测
-        logits = self.classifier(embeddings)  # 输出 shape [N, 1]
-        return embeddings, logits
+        return embeddings
 
 #############################################
 # 训练、数据加载及主流程
 #############################################
-
-def train_supervised(model, loader, optimizer, device, scaler, merchant_labels, criterion):
+def train_unsupervised(model, loader, optimizer, device, scaler):
     model.train()
     total_loss = 0.0
     for batch in loader:
         batch = batch.to(device)
-        # 优先使用在 main() 中赋值给 model 的 merchant_ids，
-        # 以避免 DataLoader 批处理后丢失原有的所有 merchant id 信息
-        if model.merchant_ids is not None:
-            merchant_id_list = model.merchant_ids
-        elif hasattr(batch, 'merchant_ids'):
-            merchant_id_list = batch.merchant_ids
-        else:
-            logging.error("当前 batch 缺少 merchant_ids 属性！")
-            continue
-
-        # 根据 merchant_id_list 生成标签，确保标签数量与 logits 数量一致
-        y = torch.tensor(
-            [float(merchant_labels.get(str(mid), 0)) for mid in merchant_id_list],
-            dtype=torch.float32,
-            device=device
-        )
-
         optimizer.zero_grad()
         with autocast():
-            embeddings, logits = model(batch.x_dict, batch.edge_index_dict)
-            logits = logits.view(-1)
-            # 检查 logits 数量是否与标签数量一致，便于调试
-            if logits.shape[0] != y.shape[0]:
-                raise ValueError(f"Logits 数量与标签数量不匹配: logits: {logits.shape[0]}, labels: {y.shape[0]}")
-            loss = criterion(logits, y)
+            # 获取 HGT 生成的无监督嵌入
+            embeddings = model(batch.x_dict, batch.edge_index_dict)
+            # 示例无监督损失：最小化嵌入向量的 L2 范数（实际任务中可更换为合适的损失函数）
+            loss = torch.mean(embeddings ** 2)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -189,9 +159,9 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(levelname)s - %(message)s")
 
-    # 图数据文件和 merchant_id_map 均放新的路径下
+    # 图数据存放目录（按月份组织的 PyG 异构图）
     graph_dir = "/mnt/hdd/user4data/pyg_graphs"
-    logging.info("加载按月份组织的 PyG 异构图...")
+    logging.info("加载按月份组织的 PyG 图数据...")
     monthly_datasets = prepare_dataset_by_month(graph_dir)
     if not monthly_datasets:
         logging.error("未找到任何图数据，请检查目录或文件格式。")
@@ -200,13 +170,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     epochs = 50
 
-    # 模型参数
+    # 模型参数设置
     hidden_channels = 128
     embed_size = 256
     num_heads = 8
     num_layers = 4
 
-    # 加载全局商户映射，使用新的路径
+    # 加载全局商户映射（merchant_id_map）路径更新至 /mnt/hdd/user4data/ 目录下
     merchant_map_path = "/mnt/hdd/user4data/merchant_id_map.pkl"
     if os.path.exists(merchant_map_path):
         try:
@@ -220,21 +190,7 @@ def main():
         logging.error(f"merchant_map_path 未找到: {merchant_map_path}")
         return
 
-    # 加载有标签文件，标签仍然在原来的目录下
-    merchant_label_path = "/home/user4/miniconda3/projects/illicitTradeDetection/data/processed/merchant_overall_labels.pt"
-    if os.path.exists(merchant_label_path):
-        try:
-            merchant_labels = torch.load(merchant_label_path)
-            logging.info("成功加载 merchant_overall_labels.pt")
-        except Exception as e:
-            logging.error(f"加载 merchant_overall_labels.pt 时出错：{e}")
-            return
-    else:
-        logging.error(f"merchant_label_path 未找到: {merchant_label_path}")
-        return
-
-    criterion = nn.BCEWithLogitsLoss()
-
+    # 按月份处理数据
     for month, graphs in sorted(monthly_datasets.items()):
         logging.info(f"----- 开始处理月份 {month} -----")
         if not graphs:
@@ -253,7 +209,8 @@ def main():
         metadata = sample_graph.metadata()  # (node_types, edge_types)
         in_channels_dict = {nt: sample_graph[nt].x.size(1) for nt in sample_graph.node_types}
 
-        model = SupervisedHGT(
+        # 初始化 HGT 模型（无监督嵌入模块）
+        hgt_model = UnsupervisedHGT(
             in_channels_dict,
             hidden_channels,
             embed_size,
@@ -261,63 +218,47 @@ def main():
             num_heads=num_heads,
             num_layers=num_layers
         ).to(device)
-
+        # 设置模型所需的 merchant_ids 与全局映射
         if hasattr(sample_graph, 'merchant_ids'):
-            model.merchant_ids = sample_graph.merchant_ids
-            model.merchant_global_map = merchant_global_map
+            hgt_model.merchant_ids = sample_graph.merchant_ids
+            hgt_model.merchant_global_map = merchant_global_map
         else:
             logging.warning("当前图数据中没有 merchant_ids 属性！")
 
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        optimizer = optim.Adam(hgt_model.parameters(), lr=0.001)
         scaler = GradScaler()
 
         for epoch in range(1, epochs + 1):
             logging.info(f"{month} - Epoch {epoch}/{epochs} 开始训练...")
-            train_loss = train_supervised(model, loader, optimizer, device, scaler, merchant_labels, criterion)
+            train_loss = train_unsupervised(hgt_model, loader, optimizer, device, scaler)
             logging.info(f"{month} - Epoch {epoch}: Train Loss = {train_loss:.4f}")
             torch.cuda.empty_cache()
 
-        # 模型评估：使用 sigmoid 得到预测值并计算简单准确率
-        model.eval()
-        monthly_predictions = {}
-        total, correct = 0, 0
+        # 使用 HGT 模型生成无监督嵌入，并保存结果
+        hgt_model.eval()
+        monthly_embeddings = {}
         with torch.no_grad():
             for data in graphs:
                 data = data.to(device)
-                _, logits = model(data.x_dict, data.edge_index_dict)
-                probs = torch.sigmoid(logits).view(-1)
-                preds = (probs > 0.5).long()
+                embeddings = hgt_model(data.x_dict, data.edge_index_dict)
                 if hasattr(data, 'merchant_ids'):
-                    for mid, pred in zip(data.merchant_ids, preds):
-                        mid = str(mid)
-                        monthly_predictions[mid] = int(pred.item())
-                        target = int(merchant_labels.get(mid, 0))
-                        if pred.item() == target:
-                            correct += 1
-                        total += 1
+                    if len(data.merchant_ids) != embeddings.size(0):
+                        logging.warning("merchant_ids 数量与嵌入数量不匹配！")
+                    for mid, emb in zip(data.merchant_ids, embeddings):
+                        monthly_embeddings[str(mid)] = emb.cpu()
                 else:
-                    for idx, pred in enumerate(preds):
-                        key = f"merchant_{idx}"
-                        monthly_predictions[key] = int(pred.item())
-                        target = int(merchant_labels.get(key, 0))
-                        if pred.item() == target:
-                            correct += 1
-                        total += 1
-            if total > 0:
-                acc = correct / total
-                logging.info(f"{month} - Evaluation accuracy: {acc:.4f}")
-            else:
-                logging.warning("评估时没有找到 merchant_ids 信息，无法计算准确率。")
+                    for idx, emb in enumerate(embeddings):
+                        monthly_embeddings[f"merchant_{idx}"] = emb.cpu()
 
-        # 保存模型参数（checkpoint）
-        checkpoint_dir = os.path.join("checkpoints", month)
+        # 将检查点存放在 /mnt/hdd/user4data/checkpoints 下
+        checkpoint_dir = os.path.join("/mnt/hdd/user4data/checkpoints", month)
         os.makedirs(checkpoint_dir, exist_ok=True)
-        model_file = os.path.join(checkpoint_dir, f"supervised_model_{month}.pth")
+        embedding_file = os.path.join(checkpoint_dir, f"monthly_embeddings_{month}.pth")
         try:
-            torch.save(model.state_dict(), model_file)
-            logging.info(f"{month} - 模型已保存到: {model_file}")
+            torch.save(monthly_embeddings, embedding_file)
+            logging.info(f"{month} - 无监督嵌入已保存到: {embedding_file}")
         except Exception as e:
-            logging.error(f"保存模型失败：{e}")
+            logging.error(f"保存嵌入失败：{e}")
 
 if __name__ == "__main__":
     main()

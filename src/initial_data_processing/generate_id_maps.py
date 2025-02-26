@@ -60,7 +60,7 @@ def main():
     logger = logging.getLogger()
     logger.info("开始生成ID映射。")
 
-    processed_dir = '../data/processed/'
+    processed_dir = '../../data/processed/'
     generate_id_maps(processed_dir)
     logger.info("ID映射生成完成。")
 

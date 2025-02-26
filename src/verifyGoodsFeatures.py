@@ -1,127 +1,57 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+check_embeddings.py
+
+用途：
+    检查存储在 /mnt/hdd/user4data/checkpoints 下各个月份的商户 embedding 信息。
+    每个文件夹对应一个月份（例如 '2021-11'），文件名为 monthly_embeddings_<month>.pth。
+    脚本会打印出每个月的 embedding 数量、数据类型以及部分样本信息，方便了解数据情况。
+"""
+
 import os
-import pickle
 import torch
-import dgl
-import logging
-import sys
 
-
-def setup_logging():
-    """配置日志记录"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()
-        ]
-    )
-
-
-def load_goods_id_map(goods_id_map_path):
-    """加载 goods_id_map.pkl 文件"""
-    try:
-        with open(goods_id_map_path, 'rb') as f:
-            goods_id_map = pickle.load(f)
-        logging.info(f"成功加载 goods_id_map.pkl，共 {len(goods_id_map)} 个商品。")
-        return goods_id_map
-    except Exception as e:
-        logging.error(f"加载 goods_id_map.pkl 失败：{e}")
-        raise
-
-
-def load_graph(graph_path):
-    """加载 .dgl 图文件"""
-    try:
-        graphs, _ = dgl.load_graphs(graph_path)
-        hetero_graph = graphs[0]
-        logging.info(f"成功加载图文件：{graph_path}")
-        return hetero_graph
-    except Exception as e:
-        logging.error(f"加载图文件 {graph_path} 失败：{e}")
-        raise
-
-
-def verify_goods_onehot(hetero_graph, goods_id_map, num_samples=5):
-    """
-    验证 'goods_onehot' 特征是否正确对应 goods_id_map。
-
-    参数：
-        hetero_graph: dgl 异构图
-        goods_id_map: dict，商品名称到唯一整数 ID 的映射
-        num_samples: int，验证的商品数量
-    """
-    if 'goods' not in hetero_graph.ntypes:
-        logging.error("图中不存在 'goods' 节点类型。")
+def check_embeddings(base_path):
+    # 获取所有文件夹名称（假设文件夹名称格式为 YYYY-MM）
+    month_dirs = sorted([d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))])
+    if not month_dirs:
+        print("未在 {} 下找到任何月份文件夹。".format(base_path))
         return
 
-    if 'goods_onehot' not in hetero_graph.nodes['goods'].data:
-        logging.error("图中 'goods' 节点未包含 'goods_onehot' 特征。")
-        return
-
-    goods_onehot = hetero_graph.nodes['goods'].data['goods_onehot']
-
-    # 创建 ID 到商品名称的反向映射
-    id_to_goods = {v: k for k, v in goods_id_map.items()}
-
-    num_goods = len(goods_id_map)
-
-    # 获取所有商品节点的索引
-    goods_node_ids = list(goods_id_map.values())
-
-    if goods_onehot.shape != torch.Size([num_goods, num_goods]):
-        logging.warning(f"'goods_onehot' 特征的形状为 {goods_onehot.shape}，预期为 ({num_goods}, {num_goods})。")
-
-    # 随机选择 num_samples 个商品进行验证
-    import random
-    sample_ids = random.sample(goods_node_ids, min(num_samples, num_goods))
-
-    for gid in sample_ids:
-        goods_name = id_to_goods.get(gid, "未知商品")
-        onehot_vector = goods_onehot[gid]
-
-        # 确认 One-Hot 向量中只有一个位置为 1，其余为 0
-        if not torch.isclose(onehot_vector.sum(), torch.tensor(1.0)):
-            logging.error(f"商品 '{goods_name}' (ID: {gid}) 的 One-Hot 向量总和不为 1：{onehot_vector}")
+    for month in month_dirs:
+        # 构造文件路径，例如 /mnt/hdd/user4data/checkpoints/2021-11/monthly_embeddings_2021-11.pth
+        file_path = os.path.join(base_path, month, f"monthly_embeddings_{month}.pth")
+        if not os.path.exists(file_path):
+            print(f"[WARNING] 文件不存在: {file_path}")
             continue
 
-        # 找到 One-Hot 向量中值为 1 的索引
-        onehot_index = torch.argmax(onehot_vector).item()
+        print("=" * 60)
+        print(f"正在处理 {file_path}")
 
-        if onehot_index != gid:
-            logging.error(
-                f"商品 '{goods_name}' (ID: {gid}) 的 One-Hot 编码不正确。期望索引 {gid}，实际索引 {onehot_index}。")
+        try:
+            data = torch.load(file_path, map_location='cpu')
+        except Exception as e:
+            print(f"加载文件 {file_path} 时出错: {e}")
+            continue
+
+        if isinstance(data, torch.Tensor):
+            # 假设 tensor 形状为 [num_merchants, embed_dim]
+            num_merchants = data.size(0)
+            embed_dim = data.size(1) if data.dim() > 1 else None
+            print(f"月份 {month}: Tensor 格式，商户数量 = {num_merchants}，embedding 维度 = {embed_dim}")
+        elif isinstance(data, dict):
+            num_merchants = len(data)
+            sample_key = list(data.keys())[0] if num_merchants > 0 else None
+            sample_shape = None
+            if sample_key is not None and isinstance(data[sample_key], torch.Tensor):
+                sample_shape = tuple(data[sample_key].shape)
+            print(f"月份 {month}: Dictionary 格式，商户数量 = {num_merchants}，示例 key = {sample_key}，示例 embedding 形状 = {sample_shape}")
         else:
-            logging.info(f"商品 '{goods_name}' (ID: {gid}) 的 One-Hot 编码正确。")
-            print(f"商品 '{goods_name}' (ID: {gid}) 的 One-Hot 编码示例：")
-            print(onehot_vector)
+            print(f"月份 {month}: 未识别的数据格式：{type(data)}")
 
-
-def main():
-    setup_logging()
-
-    # 定义路径
-    goods_id_map_path = '../data/processed/goods_id_map.pkl'
-    graph_path = '../data/processed/graphs_with_goods_feature/hetero_graph_2021-11.dgl'  # 替换为实际图文件路径
-
-    # 检查 goods_id_map_path 是否存在
-    if not os.path.exists(goods_id_map_path):
-        logging.error(f"goods_id_map.pkl 文件不存在: {goods_id_map_path}")
-        sys.exit(1)
-
-    # 检查 graph_path 是否存在
-    if not os.path.exists(graph_path):
-        logging.error(f"图文件不存在: {graph_path}")
-        sys.exit(1)
-
-    # 加载 goods_id_map
-    goods_id_map = load_goods_id_map(goods_id_map_path)
-
-    # 加载图
-    hetero_graph = load_graph(graph_path)
-
-    # 验证 One-Hot 编码
-    verify_goods_onehot(hetero_graph, goods_id_map, num_samples=5)
-
+    print("=" * 60)
 
 if __name__ == "__main__":
-    main()
+    base_path = "/mnt/hdd/user4data/checkpoints"
+    check_embeddings(base_path)

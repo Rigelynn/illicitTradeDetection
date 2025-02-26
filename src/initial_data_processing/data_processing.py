@@ -206,8 +206,8 @@ def main():
     logging.info("数据处理脚本启动。")
 
     # 定义数据目录
-    data_dir = '../data/raw/'
-    processed_dir = '../data/processed/'
+    data_dir = '../../data/raw/'
+    processed_dir = '../../data/processed/'
 
     # 数据库连接参数（请根据实际情况填写）
     db_params = {
