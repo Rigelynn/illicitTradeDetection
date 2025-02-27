@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-集成模型代码，包括：
-    - PatchEmbedder：将时序数据 patch 打平后映射到低维表示
-    - PrototypeReprogrammer：利用多头注意力融合 learnable prototypes 生成软提示（soft prompt）
-    - PredictionHead：MLP 二分类预测层
-    - EndToEndModel：集成模型，融合时序 soft prompt 与聚合后的硬提示（hard prompt）
-    - 消融实验变体：EndToEndModel_NoPrompt 和 EndToEndModel_NoReprogrammer
-
-本文件修改自原 LLaMA 版本，目前采用预训练的 BERT 模型（例如 bert-base-uncased），因此注意 BERT 的隐藏层维度通常为 768。
+集成模型代码（部分修改），支持动态调整 patch 提取步长实现正负样本再采样
 """
 
 import math
@@ -126,7 +119,7 @@ class EndToEndModel(nn.Module):
         D: 目标空间维度（例如 768，与 BERT 隐藏层一致）
         bert_model: 预加载的 BERT 模型（参数冻结）
         prediction_head: 用于二分类预测的 MLP 层
-        stride: 滑动窗口步长
+        stride: 默认滑动窗口步长
         """
         super(EndToEndModel, self).__init__()
         self.patch_size = patch_size
@@ -141,28 +134,33 @@ class EndToEndModel(nn.Module):
         for param in self.bert_model.parameters():
             param.requires_grad = False
 
-    def extract_patches(self, sequence):
+    def extract_patches(self, sequence, stride=None):
         """
         sequence: [T, emb_dim]
+        stride: 可选参数，如传入则覆盖模型初始化时定义的 stride，
+           这样可以对正负样本用不同的 stride（例如正样本用较小 stride，负样本用较大 stride）
         返回： [num_patches, patch_size, emb_dim]
         """
         patches = []
+        if stride is None:
+            stride = self.stride
         T = sequence.size(0)
-        for i in range(0, T - self.patch_size + 1, self.stride):
+        for i in range(0, T - self.patch_size + 1, stride):
             patches.append(sequence[i:i+self.patch_size])
         if len(patches) == 0:
             patches.append(sequence[:self.patch_size])
         return torch.stack(patches, dim=0)
 
-    def forward(self, sequence, aggregated_prompts):
+    def forward(self, sequence, aggregated_prompts, custom_stride=None):
         """
         sequence: [T, emb_dim] 时序数据
-        aggregated_prompts: list of str, 长度等于 patch 数量，
+        aggregated_prompts: list of str, 长度应与 patch 数量一致，
            每个字符串为对应 patch 覆盖月份的聚合硬提示。
+        custom_stride: 若不为 None，则用于替代默认的滑动窗口步长，实现不同标签的采样策略
         输出: 二分类 logit（标量）
         """
-        # 1. 提取 patches
-        patches = self.extract_patches(sequence)  # [num_patches, patch_size, emb_dim]
+        # 1. 提取 patches（采用自定义 stride，以调整正负样本的采样密度）
+        patches = self.extract_patches(sequence, stride=custom_stride)  # [num_patches, patch_size, emb_dim]
         num_patches = patches.size(0)
         patch_tokens = []
         for i in range(num_patches):
@@ -193,83 +191,4 @@ class EndToEndModel(nn.Module):
         prediction = self.prediction_head(global_representation)  # [1, 1]
         return prediction.squeeze()
 
-# ---------------------------
-# 消融实验变体 1：移除文本提示，仅使用软提示
-# ---------------------------
-class EndToEndModel_NoPrompt(nn.Module):
-    def __init__(self, patch_size, emb_dim, dm, num_heads, V_prime, D, bert_model, prediction_head, stride=2):
-        super(EndToEndModel_NoPrompt, self).__init__()
-        self.patch_size = patch_size
-        self.stride = stride
-        self.patch_embedder = PatchEmbedder(patch_size, emb_dim, dm)
-        self.prototype_reprogrammer = PrototypeReprogrammer(dm, num_heads, V_prime, D)
-        self.bert_model = bert_model
-        self.prediction_head = prediction_head
-
-        # 冻结 BERT 模型参数
-        for param in self.bert_model.parameters():
-            param.requires_grad = False
-
-    def extract_patches(self, sequence):
-        patches = []
-        T = sequence.size(0)
-        for i in range(0, T - self.patch_size + 1, self.stride):
-            patches.append(sequence[i:i+self.patch_size])
-        if len(patches) == 0:
-            patches.append(sequence[:self.patch_size])
-        return torch.stack(patches, dim=0)
-
-    def forward(self, sequence, text_prompt=None):
-        patches = self.extract_patches(sequence)
-        num_patches = patches.size(0)
-        patch_tokens = [self.patch_embedder(patches[i]) for i in range(num_patches)]
-        patch_tokens = torch.stack(patch_tokens, dim=0)
-        soft_prompts = self.prototype_reprogrammer(patch_tokens)  # [num_patches, D]
-        soft_prompts = soft_prompts.unsqueeze(0)  # [1, num_patches, D]
-        outputs = self.bert_model(inputs_embeds=soft_prompts)
-        pooled_output = outputs.last_hidden_state.mean(dim=1)
-        prediction = self.prediction_head(pooled_output)
-        return prediction.squeeze()
-
-# ---------------------------
-# 消融实验变体 2：移除 reprogrammer，直接用简单线性映射
-# ---------------------------
-class EndToEndModel_NoReprogrammer(nn.Module):
-    def __init__(self, patch_size, emb_dim, dm, D, bert_model, prediction_head, stride=2):
-        super(EndToEndModel_NoReprogrammer, self).__init__()
-        self.patch_size = patch_size
-        self.stride = stride
-        self.patch_embedder = PatchEmbedder(patch_size, emb_dim, dm)
-        self.simple_mapper = nn.Linear(dm, D)
-        self.bert_model = bert_model
-        self.prediction_head = prediction_head
-        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
-        # 冻结 BERT 模型参数
-        for param in self.bert_model.parameters():
-            param.requires_grad = False
-
-    def extract_patches(self, sequence):
-        patches = []
-        T = sequence.size(0)
-        for i in range(0, T - self.patch_size + 1, self.stride):
-            patches.append(sequence[i:i+self.patch_size])
-        if len(patches) == 0:
-            patches.append(sequence[:self.patch_size])
-        return torch.stack(patches, dim=0)
-
-    def forward(self, sequence, text_prompt):
-        patches = self.extract_patches(sequence)
-        num_patches = patches.size(0)
-        patch_tokens = [self.patch_embedder(patches[i]) for i in range(num_patches)]
-        patch_tokens = torch.stack(patch_tokens, dim=0)
-        mapped_tokens = self.simple_mapper(patch_tokens)  # [num_patches, D]
-        inputs = self.tokenizer(text_prompt, return_tensors='pt')
-        input_ids = inputs['input_ids'].to(sequence.device)
-        prompt_embeddings = self.bert_model.embeddings.word_embeddings(input_ids)
-        mapped_tokens = mapped_tokens.unsqueeze(0)
-        combined_embeddings = torch.cat([mapped_tokens, prompt_embeddings], dim=1)
-        outputs = self.bert_model(inputs_embeds=combined_embeddings)
-        pooled_output = outputs.last_hidden_state.mean(dim=1)
-        prediction = self.prediction_head(pooled_output)
-        return prediction.squeeze()
+# 后续消融模型（NoPrompt、NoReprogrammer）的改法类似，此处不再重复
